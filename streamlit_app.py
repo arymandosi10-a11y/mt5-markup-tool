@@ -1,49 +1,109 @@
+# streamlit_app.py
+# ✅ Works on Streamlit Cloud (NO yfinance)
+# ✅ Real-time FX rates (public API) + real-time-ish symbol prices (Stooq CSV)
+# ✅ Correct notional for FX vs Indices/Energies/Metals/CFDs
+# ✅ Per $1M USD notional LP commission
+# ✅ Excel download
+
 import re
 from io import BytesIO
 
 import pandas as pd
 import requests
 import streamlit as st
-import yfinance as yf
 
 # ============================================================
-# PAGE CONFIG
+# PAGE
 # ============================================================
 st.set_page_config(page_title="MarkupX – MT5 Cost Engine", layout="wide")
+st.title("📊 MarkupX – MT5 Markup, Notional & LP Commission (USD)")
+st.caption("FX uses base→USD; Indices/Energies/Metals/CFDs use live price × contract size × lots. (Per $1M notional)")
 
 # ============================================================
-# FX RATES (SAFE + FALLBACK)
-# Returns mapping: 1 CCY = X USD
+# SETTINGS
 # ============================================================
-@st.cache_data(ttl=3600)
+with st.sidebar:
+    st.header("Settings")
+    lots = st.number_input("Lots", min_value=0.01, value=1.00, step=0.01)
+    markup_points = st.number_input("Markup (points)", min_value=0.0, value=20.0, step=1.0)
+    lp_rate = st.number_input("LP rate ($ per 1M per side)", min_value=0.0, value=7.0, step=0.5)
+    sides = st.selectbox("Sides", [1, 2], index=1)
+
+    st.divider()
+    st.subheader("Live prices source (NO broker API)")
+    st.caption("Uses Stooq (free). Broker prices can differ slightly. For exact broker pricing, use MT5 Bid/Ask export.")
+    use_live_prices = st.toggle("Use live prices (Stooq)", value=True)
+
+    st.divider()
+    st.subheader("Symbol → Stooq mapping (editable)")
+    st.caption("Format: MT5_SYMBOL=stooq_symbol (one per line)")
+    st.caption("Examples: NAS100=^ndx, SP500=^spx, WS30=^dji, USOIL=cl.f, UKOIL=brn.f, XAUUSD=xauusd, XAGUSD=xagusd")
+    mapping_text = st.text_area(
+        "Mapping",
+        value=(
+            "NAS100=^ndx\n"
+            "US100=^ndx\n"
+            "SP500=^spx\n"
+            "US500=^spx\n"
+            "WS30=^dji\n"
+            "US30=^dji\n"
+            "DJIUSD=^dji\n"
+            "USOIL=cl.f\n"
+            "WTI=cl.f\n"
+            "UKOIL=brn.f\n"
+            "BRENT=brn.f\n"
+            "XAUUSD=xauusd\n"
+            "XAGUSD=xagusd\n"
+            "BTCUSD=btcusd\n"
+            "ETHUSD=ethusd\n"
+        ),
+        height=180,
+    )
+
+    st.divider()
+    st.subheader("Optional")
+    st.caption("Paste manual prices if needed (highest priority). Format: SYMBOL=PRICE")
+    manual_prices_text = st.text_area("Manual Prices", value="", height=120)
+
+spec_file = st.file_uploader("Upload MT5 Symbol Export (Excel .xlsx)", type=["xlsx"])
+
+# ============================================================
+# FX RATES (USD base) -> convert to "1 CCY = X USD"
+# ============================================================
+@st.cache_data(ttl=300)
 def fx_to_usd() -> dict:
+    """
+    Returns dict where: 1 CCY = X USD
+    """
     urls = [
         "https://open.er-api.com/v6/latest/USD",
         "https://api.exchangerate.host/latest?base=USD",
     ]
-
     for url in urls:
         try:
             r = requests.get(url, timeout=15)
             r.raise_for_status()
             data = r.json()
 
+            rates = None
             if isinstance(data, dict):
                 if "rates" in data and isinstance(data["rates"], dict):
-                    rates = data["rates"]  # 1 USD = X CCY
+                    rates = data["rates"]
                 elif "conversion_rates" in data and isinstance(data["conversion_rates"], dict):
-                    rates = data["conversion_rates"]  # 1 USD = X CCY
-                else:
-                    continue
+                    rates = data["conversion_rates"]
 
-                fx = {ccy: (1.0 / float(val)) for ccy, val in rates.items() if val}
-                fx["USD"] = 1.0
-                return fx
+            if not rates:
+                continue
+
+            # rates: 1 USD = X CCY  =>  1 CCY = 1/X USD
+            out = {ccy.upper(): (1.0 / float(v)) for ccy, v in rates.items() if v}
+            out["USD"] = 1.0
+            return out
 
         except Exception:
             continue
 
-    st.warning("FX API unavailable. Using fallback USD rates (verify for accuracy).")
+    st.warning("FX API unavailable. Using fallback FX (verify).")
     return {
         "USD": 1.0,
         "EUR": 1.08,
@@ -64,94 +124,54 @@ def fx_to_usd() -> dict:
         "CNH": 0.14,
     }
 
-
 # ============================================================
-# LIVE PRICES (YAHOO FINANCE)
-# Returns mapping: MT5 SymbolKey -> live price
+# STOOQ LIVE PRICES (CSV)
 # ============================================================
-@st.cache_data(ttl=30)
-def get_live_prices_yf(symbol_to_yahoo: dict) -> dict:
+@st.cache_data(ttl=60)
+def stooq_last_close(stooq_symbol: str):
     """
-    symbol_to_yahoo: {"NAS100":"^NDX", "XAUUSD":"GC=F", ...}
-    Returns: {"NAS100": 17500.0, "XAUUSD": 2045.3, ...}
+    Pulls last close from Stooq CSV.
+    Returns float or None.
     """
-    if not symbol_to_yahoo:
-        return {}
-
-    # Unique tickers
-    tickers = sorted({t for t in symbol_to_yahoo.values() if t})
-    if not tickers:
-        return {}
-
-    # Download last close (1m bars) - good enough for "near real-time"
-    data = yf.download(tickers=tickers, period="1d", interval="1m", progress=False)
-
-    # Build latest close dict by ticker
-    last_by_ticker = {}
-
     try:
-        # Multi-ticker format -> columns are MultiIndex
-        if isinstance(data.columns, pd.MultiIndex):
-            close_df = data["Close"].ffill()
-            if not close_df.empty:
-                last_row = close_df.iloc[-1]
-                last_by_ticker = last_row.to_dict()
-        else:
-            # Single ticker format -> normal columns
-            close_series = data["Close"].ffill()
-            if not close_series.empty:
-                last_by_ticker[tickers[0]] = float(close_series.iloc[-1])
+        # Example: https://stooq.com/q/l/?s=^ndx&f=sd2t2ohlcv&h&e=csv
+        url = f"https://stooq.com/q/l/?s={stooq_symbol}&f=sd2t2ohlcv&h&e=csv"
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+
+        lines = r.text.strip().splitlines()
+        if len(lines) < 2:
+            return None
+
+        # Header: Symbol,Date,Time,Open,High,Low,Close,Volume
+        row = lines[1].split(",")
+        if len(row) < 7:
+            return None
+
+        close_val = row[6]
+        px = float(close_val)
+        if px <= 0:
+            return None
+        return px
     except Exception:
-        return {}
+        return None
 
-    # Invert mapping ticker->symbol
-    ticker_to_symbol = {}
-    for sym, tk in symbol_to_yahoo.items():
-        if tk:
-            ticker_to_symbol[tk] = sym
-
+def parse_mapping(text: str) -> dict:
     out = {}
-    for tk, px in last_by_ticker.items():
-        if tk in ticker_to_symbol and pd.notna(px):
-            out[ticker_to_symbol[tk]] = float(px)
+    if not text:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip().upper()
+        v = v.strip()
+        if k and v:
+            out[k] = v
     return out
 
-
-# ============================================================
-# HELPERS
-# ============================================================
-def parse_symbol(sym: str):
-    """
-    Best-effort parse for FX pairs (EURUSD, GBPJPY etc.).
-    Returns (Base, Quote) or (None, None) for non-FX.
-    """
-    s = str(sym).upper().strip()
-
-    parts = re.findall(r"[A-Z]{3}", s)
-    if len(parts) >= 2:
-        return parts[0], parts[1]
-
-    letters = re.sub(r"[^A-Z]", "", s)
-    if len(letters) >= 6:
-        return letters[:3], letters[3:6]
-
-    return None, None
-
-
-def to_excel(df: pd.DataFrame) -> bytes:
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name="Report")
-    return buf.getvalue()
-
-
 def parse_manual_prices(text: str) -> dict:
-    """
-    Lines like:
-    NAS100=17500
-    USOIL=72.5
-    XAUUSD=2040.2
-    """
     out = {}
     if not text:
         return out
@@ -167,209 +187,162 @@ def parse_manual_prices(text: str) -> dict:
             pass
     return out
 
+def parse_fx_pair(symbol: str):
+    """
+    Best-effort parse for FX-like strings: EURUSD, GBPJPY, etc.
+    Returns (base, quote) or (None, None)
+    """
+    s = str(symbol).upper().strip()
+    # Extract first two 3-letter groups from symbol
+    parts = re.findall(r"[A-Z]{3}", s)
+    if len(parts) >= 2:
+        return parts[0], parts[1]
+    # Fallback: letters only
+    letters = re.sub(r"[^A-Z]", "", s)
+    if len(letters) >= 6:
+        return letters[:3], letters[3:6]
+    return None, None
 
-def norm_key(x) -> str:
-    return str(x).upper().strip()
-
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Report")
+    return buf.getvalue()
 
 # ============================================================
-# UI
+# MAIN
 # ============================================================
-st.title("📊 MarkupX – MT5 Markup, Notional & LP Commission")
-st.caption("Per $1M USD notional • Supports FX + Indices + Energies + Metals • Live FX + Live Prices")
-
-with st.sidebar:
-    st.header("Settings")
-    lots = st.number_input("Lots", min_value=0.01, value=1.00, step=0.01)
-    markup_points = st.number_input("Markup (points)", min_value=0.0, value=20.0, step=1.0)
-    lp_rate = st.number_input("LP rate ($ per 1M per side)", min_value=0.0, value=7.0, step=0.5)
-    sides = st.selectbox("Sides", [1, 2], index=1)
-
-    st.divider()
-    st.subheader("Live prices")
-    use_live_prices = st.toggle("Use Yahoo Finance live prices", value=True)
-    st.caption("If broker prices differ, prefer MT5 Bid/Ask export instead of Yahoo.")
-
-    st.divider()
-    st.subheader("Manual Prices (optional)")
-    st.caption("Format: NAS100=17500 (one per line)")
-    manual_prices_text = st.text_area("Paste manual prices", height=120)
-
-spec_file = st.file_uploader("Upload MT5 Symbol Export (Excel .xlsx)", type=["xlsx"], key="spec")
-price_file = st.file_uploader(
-    "Upload Prices file (optional) - columns: Symbol Name, Price",
-    type=["xlsx", "csv"],
-    key="price",
-)
-
 if not spec_file:
-    st.info("Required columns: Symbol Name, Digits, Profit Currency, Contract Size")
+    st.info("Upload your MT5 symbol export (.xlsx). Required columns: Symbol Name, Digits, Profit Currency, Contract Size")
     st.stop()
 
-# ============================================================
-# READ SPECS
-# ============================================================
 df = pd.read_excel(spec_file)
+df.columns = [c.strip() for c in df.columns]
 
 required = ["Symbol Name", "Digits", "Profit Currency", "Contract Size"]
 missing = [c for c in required if c not in df.columns]
 if missing:
-    st.error(f"Missing columns in MT5 export: {missing}")
+    st.error(f"Missing columns: {missing}")
     st.stop()
 
+# Normalize
 df["Symbol Name"] = df["Symbol Name"].astype(str).str.strip()
-df["SymbolKey"] = df["Symbol Name"].map(norm_key)
+df["SymbolKey"] = df["Symbol Name"].str.upper()
 df["Profit Currency"] = df["Profit Currency"].astype(str).str.upper().str.strip()
-
 df["Digits"] = pd.to_numeric(df["Digits"], errors="coerce")
 df["Contract Size"] = pd.to_numeric(df["Contract Size"], errors="coerce")
 
-# ============================================================
-# FX MAP
-# ============================================================
+# FX map
 fx = fx_to_usd()
-df["Base"], df["Quote"] = zip(*df["Symbol Name"].map(parse_symbol))
 
+# Parse base/quote & classify FX ONLY if both are valid currencies in FX table
+bases, quotes = [], []
+is_fx_list = []
+for sym in df["Symbol Name"].tolist():
+    b, q = parse_fx_pair(sym)
+    b_ok = b in fx if b else False
+    q_ok = q in fx if q else False
+    is_fx = bool(b_ok and q_ok)
+    bases.append(b if is_fx else None)
+    quotes.append(q if is_fx else None)
+    is_fx_list.append(is_fx)
+
+df["Base"] = bases
+df["Quote"] = quotes
+df["Is_FX"] = is_fx_list
+
+# Profit currency conversion to USD
 df["Profit_to_USD"] = df["Profit Currency"].map(fx).fillna(1.0)
-df["Base_to_USD"] = df["Base"].map(fx)  # NaN for non-FX
 
-# ============================================================
-# POINT VALUE + MARKUP
-# Fix: float base so negative powers work
-# ============================================================
+# Base currency conversion (for FX)
+df["Base_to_USD"] = df["Base"].map(fx)
+
+# Point size (fix: float base)
 df["PointSize"] = (10.0 ** (-df["Digits"].astype(float))).fillna(0.0)
+
+# Point value per lot (in ProfitCcy) then to USD
 df["PointValue_ProfitCcy_perLot"] = df["Contract Size"].fillna(0.0) * df["PointSize"]
 df["PointValue_USD_perLot"] = df["PointValue_ProfitCcy_perLot"] * df["Profit_to_USD"]
 
+# Markup in USD
 df["Markup_USD"] = df["PointValue_USD_perLot"] * float(markup_points) * float(lots)
 
-# ============================================================
-# PRICES - Priority:
-# 1) Uploaded prices file
-# 2) Manual pasted prices
-# 3) Live prices (Yahoo)
-# ============================================================
-price_map = {}
+# -------------------------
+# LIVE PRICES (for non-FX)
+# -------------------------
+mapping = parse_mapping(mapping_text)
+manual_prices = parse_manual_prices(manual_prices_text)
 
-# 1) Uploaded prices file
-if price_file is not None:
-    try:
-        if str(price_file.name).lower().endswith(".csv"):
-            pdf = pd.read_csv(price_file)
-        else:
-            pdf = pd.read_excel(price_file)
+df["Price_Source"] = ""
+df["Price"] = pd.NA
 
-        if "Symbol Name" in pdf.columns and "Price" in pdf.columns:
-            pdf["SymbolKey"] = pdf["Symbol Name"].map(norm_key)
-            pdf["Price"] = pd.to_numeric(pdf["Price"], errors="coerce")
-            price_map.update(dict(zip(pdf["SymbolKey"], pdf["Price"])))
-        else:
-            st.warning("Prices file ignored: it must contain 'Symbol Name' and 'Price' columns.")
-    except Exception as e:
-        st.warning(f"Could not read Prices file: {e}")
+# Manual prices first (highest priority)
+df.loc[df["SymbolKey"].isin(manual_prices.keys()), "Price"] = df["SymbolKey"].map(manual_prices)
+df.loc[df["SymbolKey"].isin(manual_prices.keys()), "Price_Source"] = "manual"
 
-# 2) Manual pasted prices
-price_map.update(parse_manual_prices(manual_prices_text))
-
-# 3) Live prices via Yahoo
-# IMPORTANT: You MUST map your MT5 symbols -> Yahoo tickers here.
-# Add your broker symbols into this dict (keys must match your MT5 Symbol Name).
-default_symbol_to_yahoo = {
-    # Indices (examples)
-    "NAS100": "^NDX",
-    "SP500": "^GSPC",
-    "US500": "^GSPC",
-    "WS30": "^DJI",
-    "DJIUSD": "^DJI",
-    "US30": "^DJI",
-
-    # Energies (examples)
-    "USOIL": "CL=F",
-    "UKOIL": "BZ=F",
-    "WTI": "CL=F",
-    "BRENT": "BZ=F",
-
-    # Metals (examples)
-    "XAUUSD": "GC=F",
-    "XAGUSD": "SI=F",
-
-    # Crypto (examples)
-    "BTCUSD": "BTC-USD",
-    "ETHUSD": "ETH-USD",
-}
-
-live_price_map = {}
+# Live prices for remaining non-FX
 if use_live_prices:
-    try:
-        # Build mapping only for symbols present in current file (faster)
-        present = set(df["SymbolKey"].tolist())
-        filtered = {k: v for k, v in default_symbol_to_yahoo.items() if norm_key(k) in present and v}
-        live_price_map = get_live_prices_yf({norm_key(k): v for k, v in filtered.items()})
-        if live_price_map:
-            st.sidebar.caption(f"Live prices loaded: {len(live_price_map)}")
-        else:
-            st.sidebar.caption("Live prices: 0 (mapping missing or Yahoo blocked)")
-    except Exception:
-        st.sidebar.caption("Live prices failed (Yahoo blocked).")
+    # only for symbols not FX and price is missing
+    need = df.loc[(~df["Is_FX"]) & (df["Price"].isna()), "SymbolKey"].unique().tolist()
+    for symkey in need:
+        stooq_sym = mapping.get(symkey)
+        if not stooq_sym:
+            continue
+        px = stooq_last_close(stooq_sym)
+        if px is None:
+            continue
+        df.loc[df["SymbolKey"] == symkey, "Price"] = px
+        df.loc[df["SymbolKey"] == symkey, "Price_Source"] = f"stooq:{stooq_sym}"
 
-# Start Price column
-df["Price"] = df["SymbolKey"].map(price_map)
-
-# Fill with live prices if missing
-if use_live_prices and live_price_map:
-    df["Price"] = df["Price"].fillna(df["SymbolKey"].map(live_price_map))
-
-# ============================================================
-# NOTIONAL LOGIC
-# FX: Notional = ContractSize * Lots * Base_to_USD
-# CFDs/Indices/Energies/Metals: Notional = Price * ContractSize * Lots * Profit_to_USD
-# ============================================================
-is_fx = df["Base"].notna() & df["Base_to_USD"].notna()
-
+# -------------------------
+# NOTIONAL USD
+# FX: ContractSize * Lots * Base_to_USD
+# CFD: Price * ContractSize * Lots * Profit_to_USD
+# -------------------------
 df["Notional_USD"] = 0.0
 
 # FX
-df.loc[is_fx, "Notional_USD"] = (
-    df.loc[is_fx, "Contract Size"].fillna(0.0) * float(lots) * df.loc[is_fx, "Base_to_USD"].fillna(0.0)
-)
-
-# Non-FX / CFDs
-non_fx = ~is_fx
-df.loc[non_fx, "Notional_USD"] = (
-    df.loc[non_fx, "Price"].fillna(0.0)
-    * df.loc[non_fx, "Contract Size"].fillna(0.0)
+df.loc[df["Is_FX"], "Notional_USD"] = (
+    df.loc[df["Is_FX"], "Contract Size"].fillna(0.0)
     * float(lots)
-    * df.loc[non_fx, "Profit_to_USD"].fillna(1.0)
+    * df.loc[df["Is_FX"], "Base_to_USD"].fillna(0.0)
 )
 
-# LP Commission per $1M per side
+# Non-FX / CFDs / Indices / Energies / Metals
+df.loc[~df["Is_FX"], "Notional_USD"] = (
+    pd.to_numeric(df.loc[~df["Is_FX"], "Price"], errors="coerce").fillna(0.0)
+    * df.loc[~df["Is_FX"], "Contract Size"].fillna(0.0)
+    * float(lots)
+    * df.loc[~df["Is_FX"], "Profit_to_USD"].fillna(1.0)
+)
+
+# LP Commission
 df["LP_Commission_USD"] = (df["Notional_USD"] / 1_000_000.0) * float(lp_rate) * float(sides)
 
+# Total cost
 df["Total_Cost_USD"] = df["Markup_USD"] + df["LP_Commission_USD"]
 
-# ============================================================
-# WARNINGS
-# ============================================================
-missing_prices = df.loc[non_fx & df["Price"].isna(), "Symbol Name"].unique().tolist()
+# Warnings for missing prices
+missing_prices = df.loc[(~df["Is_FX"]) & (pd.to_numeric(df["Price"], errors="coerce").isna()), "Symbol Name"].unique().tolist()
 if missing_prices:
     st.warning(
-        "Missing LIVE/Manual/Uploaded price for these non-FX symbols (Notional & LP commission will be 0): "
+        "Missing live/manual price for these non-FX symbols (Notional & LP commission will be 0): "
         + ", ".join(missing_prices)
-        + "\n\nFix: Add them in mapping (default_symbol_to_yahoo) or upload/paste prices."
+        + "\n\nFix: Add mapping in sidebar (SYMBOL=stooq_symbol) or paste manual prices."
     )
 
-# ============================================================
-# REPORT
-# ============================================================
+# Report
 report = df[
     [
         "Symbol Name",
         "Profit Currency",
+        "Is_FX",
         "Base",
         "Quote",
         "Digits",
         "Contract Size",
         "Price",
+        "Price_Source",
         "PointValue_USD_perLot",
         "Markup_USD",
         "Notional_USD",
@@ -383,14 +356,14 @@ st.dataframe(report, use_container_width=True)
 
 st.download_button(
     "⬇️ Download Excel Report",
-    data=to_excel(report),
+    data=to_excel_bytes(report),
     file_name="MarkupX_Report.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 
 st.markdown("### Notes")
 st.write(
-    "- **FX pairs** notional uses base currency conversion.\n"
-    "- **Indices/Energies/Metals/CFDs** notional uses **live Price × ContractSize × Lots**.\n"
-    "- For best accuracy, prefer MT5 Bid/Ask export if available."
+    "- **FX** notional uses **Base→USD** found from live FX rates.\n"
+    "- **Indices/Energies/Metals/CFDs** notional uses **live Price × Contract Size × Lots × ProfitCurrency→USD**.\n"
+    "- Live prices come from **Stooq** (free). If your broker prices differ, paste manual prices or export MT5 Bid/Ask."
 )
