@@ -41,45 +41,6 @@ def fx_to_usd():
     st.warning("FX API unavailable. Using fallback FX rates (verify).")
     return {"USD": 1.0, "EUR": 1.08, "GBP": 1.26, "JPY": 0.0068, "AUD": 0.66, "CAD": 0.74, "CHF": 1.11}
 
-# ============================================================
-# MARKET PRICE (STOOQ - free, may be delayed / partial coverage)
-# ============================================================
-@st.cache_data(ttl=60)
-def stooq_last_close(stooq_symbol: str):
-    """
-    Returns last close price from Stooq CSV, or None if not available.
-    """
-    try:
-        url = f"https://stooq.com/q/l/?s={stooq_symbol}&f=sd2t2ohlcv&h&e=csv"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        lines = r.text.strip().splitlines()
-        if len(lines) < 2:
-            return None
-        row = lines[1].split(",")
-        if len(row) < 7:
-            return None
-        px = float(row[6])  # Close
-        return px if px > 0 else None
-    except Exception:
-        return None
-
-def parse_mapping(txt: str) -> dict:
-    """
-    Parse mapping lines:
-      MT5_SYMBOL=STOOQ_SYMBOL
-    """
-    m = {}
-    if not txt:
-        return m
-    for line in txt.splitlines():
-        line = line.strip()
-        if not line or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        m[k.strip().upper()] = v.strip()
-    return m
-
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
@@ -110,32 +71,6 @@ with st.sidebar:
     else:
         ib_points = st.number_input("IB (points)", min_value=0.0, value=0.0, step=1.0)
         ib_fixed_per_lot = 0.0
-
-    st.divider()
-    st.subheader("Market price integration (optional)")
-    fetch_market_prices = st.toggle("Override Current Price using market data (Stooq)", value=False)
-    st.caption("If a symbol is not supported by Stooq, it keeps your file price.")
-
-    mapping_text = st.text_area(
-        "Stooq mapping (MT5_SYMBOL=STOOQ_SYMBOL)",
-        height=190,
-        value=(
-            "NAS100=^ndx\n"
-            "US500=^spx\n"
-            "US30=^dji\n"
-            "GER30=^dax\n"
-            "FRA40=^cac\n"
-            "UK100=^ftse\n"
-            "JP225=^nkx\n"
-            "HK50=^hsi\n"
-            "USOIL=cl.f\n"
-            "UKOIL=brn.f\n"
-            "XAUUSD=xauusd\n"
-            "XAGUSD=xagusd\n"
-            "BTCUSD=btcusd\n"
-            "ETHUSD=ethusd\n"
-        ),
-    )
 
 # ============================================================
 # FILE UPLOAD
@@ -170,31 +105,9 @@ fx = fx_to_usd()
 df["Profit_to_USD"] = df["Profit Currency"].map(fx).fillna(1.0)
 
 # ============================================================
-# PRICE
+# PRICE (ONLY from file)
 # ============================================================
 df["Price"] = df["Current Price"].copy()
-df["Price_Source"] = "file"
-
-if fetch_market_prices:
-    mp = parse_mapping(mapping_text)
-    updated = 0
-    missing_px = []
-
-    for sym in df["Symbol"].unique().tolist():
-        stooq_sym = mp.get(sym)
-        if not stooq_sym:
-            continue
-        px = stooq_last_close(stooq_sym)
-        if px is None:
-            missing_px.append(sym)
-            continue
-        df.loc[df["Symbol"] == sym, "Price"] = px
-        df.loc[df["Symbol"] == sym, "Price_Source"] = f"stooq:{stooq_sym}"
-        updated += 1
-
-    st.sidebar.success(f"Market prices updated: {updated}")
-    if missing_px:
-        st.sidebar.warning("Stooq missing for: " + ", ".join(missing_px[:12]) + (" ..." if len(missing_px) > 12 else ""))
 
 # ============================================================
 # CALCULATIONS (Profit → USD)
@@ -205,7 +118,7 @@ df["PointSize"] = (10.0 ** (-df["Digits"].astype(float))).fillna(0.0)
 # Point value per lot in PROFIT currency
 df["PointValue_Profit_perLot"] = df["Contract Size"].fillna(0.0) * df["PointSize"]
 
-# Point value per lot in USD (requested)
+# Point value per lot in USD
 df["PointValue_USD_perLot"] = df["PointValue_Profit_perLot"] * df["Profit_to_USD"]
 
 # Markup
@@ -225,7 +138,7 @@ if ib_type == "Fixed ($ per lot)":
 else:
     df["IB_Commission_USD"] = df["PointValue_USD_perLot"] * float(ib_points) * float(lots)
 
-# Brokerage (your formula)
+# Brokerage
 df["Brokerage_USD"] = df["Markup_USD"] - df["LP_Commission_USD"] - df["IB_Commission_USD"]
 
 # ============================================================
@@ -236,7 +149,6 @@ report = df[
         "Symbol Name",
         "Profit Currency",
         "Price",
-        "Price_Source",
         "Digits",
         "Contract Size",
         "PointSize",
