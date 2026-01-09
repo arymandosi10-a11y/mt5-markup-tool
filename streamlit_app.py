@@ -216,26 +216,18 @@ report_cols = [
     "Symbol Name",
     "Profit Currency",
     "Price",
-    "Price_Source",
     "Digits",
     "Contract Size",
     "PointSize",
     "PointValue_Profit_perLot",
     "PointValue_USD_perLot",
-    "Markup_Profit",
     "Markup_USD",
-    "Notional_Profit",
-    "Notional_USD",
     "LP_Commission_USD",
     "IB_Commission_USD",
     "Brokerage_USD",
     "Broker_Negative",
-    "Min_Markup_Points_Breakeven",
-    "Suggested_Markup_Points",
-    "Brokerage_USD_If_Suggested",
-    "Still_Negative_After_Suggested",
-    "FX_Missing",
 ]
+
 
 report = df[report_cols].copy()
 
