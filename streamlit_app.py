@@ -221,6 +221,7 @@ report_cols = [
     "PointSize",
     "PointValue_Profit_perLot",
     "PointValue_USD_perLot",
+    "Markup_Profit",
     "Markup_USD",
     "LP_Commission_USD",
     "IB_Commission_USD",
