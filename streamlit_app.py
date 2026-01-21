@@ -34,9 +34,6 @@ def fx_to_usd() -> dict:
             r.raise_for_status()
             data = r.json()
 
-            # API variations:
-            # - open.er-api: conversion_rates
-            # - exchangerate.host: rates
             rates = data.get("rates") or data.get("conversion_rates")  # 1 USD = X CCY
             if not rates:
                 continue
@@ -68,6 +65,41 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 
 # ============================================================
+# CLIENT COMMISSION PARSER (SYMBOL-WISE)
+# ============================================================
+def parse_commission_overrides(text: str) -> dict:
+    """
+    Accepts lines like:
+      US100=10
+      JP225=1
+      XAUUSD=7.5
+
+    Also allows commas:
+      US100,10
+    """
+    out = {}
+    if not text:
+        return out
+
+    lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
+    for ln in lines:
+        ln = ln.replace(" ", "")
+        if "=" in ln:
+            k, v = ln.split("=", 1)
+        elif "," in ln:
+            k, v = ln.split(",", 1)
+        else:
+            continue
+
+        k = str(k).upper().strip()
+        try:
+            out[k] = float(v)
+        except Exception:
+            continue
+    return out
+
+
+# ============================================================
 # SIDEBAR
 # ============================================================
 with st.sidebar:
@@ -75,6 +107,40 @@ with st.sidebar:
 
     lots = st.number_input("Lots", min_value=0.01, value=1.00, step=0.01)
     markup_points = st.number_input("Markup (points)", min_value=0.0, value=20.0, step=1.0)
+
+    # ✅ NEW: CLIENT COMMISSION SECTION (BELOW MARKUP)
+    st.subheader("Client Commission (USD)")
+    commission_mode = st.selectbox(
+        "Commission mode",
+        ["None", "Fixed ($ per lot)", "Symbol-wise ($ per lot)"],
+        index=0
+    )
+
+    client_comm_default_per_lot = 0.0
+    client_comm_overrides_text = ""
+    client_comm_overrides = {}
+
+    if commission_mode == "Fixed ($ per lot)":
+        client_comm_default_per_lot = st.number_input(
+            "Commission ($ per lot)",
+            min_value=0.0,
+            value=0.0,
+            step=0.5
+        )
+    elif commission_mode == "Symbol-wise ($ per lot)":
+        client_comm_default_per_lot = st.number_input(
+            "Default commission ($ per lot)",
+            min_value=0.0,
+            value=0.0,
+            step=0.5
+        )
+        st.caption("Overrides format (one per line): US100=10  |  JP225=1  |  XAUUSD=7.5")
+        client_comm_overrides_text = st.text_area(
+            "Overrides",
+            value="US100=10\nJP225=1",
+            height=110
+        )
+        client_comm_overrides = parse_commission_overrides(client_comm_overrides_text)
 
     st.divider()
     st.subheader("LP Commission")
@@ -149,35 +215,29 @@ df["Price_Source"] = "file"
 fx = fx_to_usd()
 df["Profit_to_USD"] = df["Profit Currency"].map(fx)
 
-# If a profit currency is missing from FX feed, keep 1.0 but flag it
 df["FX_Missing"] = df["Profit_to_USD"].isna()
 df["Profit_to_USD"] = df["Profit_to_USD"].fillna(1.0)
 
 # ============================================================
 # CALCULATIONS (Profit → USD)
 # ============================================================
-# Point size
 df["PointSize"] = (10.0 ** (-df["Digits"].astype(float))).fillna(0.0)
 
-# Point value per lot in PROFIT currency
-# (Works for FX + indices/metals/energies if profit currency is correct)
 df["PointValue_Profit_perLot"] = df["Contract Size"].fillna(0.0) * df["PointSize"].fillna(0.0)
-
-# Point value per lot in USD
 df["PointValue_USD_perLot"] = df["PointValue_Profit_perLot"] * df["Profit_to_USD"]
 
 # Markup
 df["Markup_Profit"] = df["PointValue_Profit_perLot"] * float(markup_points) * float(lots)
 df["Markup_USD"] = df["Markup_Profit"] * df["Profit_to_USD"]
 
-# Notional (in profit currency using file price)
+# Notional
 df["Notional_Profit"] = df["Price"].fillna(0.0) * df["Contract Size"].fillna(0.0) * float(lots)
 df["Notional_USD"] = df["Notional_Profit"] * df["Profit_to_USD"]
 
-# LP Commission ($ per 1M per side) - uses sides
+# LP Commission
 df["LP_Commission_USD"] = (df["Notional_USD"] / 1_000_000.0) * float(lp_rate) * float(sides)
 
-# IB Commission (NO SIDES for any type)
+# IB Commission (NO SIDES)
 if ib_mode == "Fixed ($ per lot)":
     df["IB_Commission_USD"] = float(ib_fixed_per_lot) * float(lots)
 elif ib_mode == "Point-wise (points)":
@@ -185,29 +245,59 @@ elif ib_mode == "Point-wise (points)":
 else:
     df["IB_Commission_USD"] = 0.0
 
-# Brokerage = Markup - LP - IB   (your requested formula)
+# ✅ NEW: CLIENT COMMISSION (USD) – FIXED USD PER LOT, SYMBOL-WISE OPTIONAL
+if commission_mode == "None":
+    df["Client_Comm_perLot_USD"] = 0.0
+elif commission_mode == "Fixed ($ per lot)":
+    df["Client_Comm_perLot_USD"] = float(client_comm_default_per_lot)
+else:
+    # Symbol-wise: default + overrides
+    df["Client_Comm_perLot_USD"] = float(client_comm_default_per_lot)
+    if client_comm_overrides:
+        df["Client_Comm_perLot_USD"] = df["Symbol"].map(client_comm_overrides).fillna(df["Client_Comm_perLot_USD"])
+
+df["Client_Commission_USD"] = df["Client_Comm_perLot_USD"] * float(lots)
+
+# Brokerage = Markup - LP - IB (your existing formula - unchanged)
 df["Brokerage_USD"] = df["Markup_USD"] - df["LP_Commission_USD"] - df["IB_Commission_USD"]
 
-# Loss flags + analytics (NO sidebar buffer option)
-df["Broker_Negative"] = df["Brokerage_USD"] < 0
+# ✅ NEW: NET Brokerage including Client Commission (recommended view)
+df["Net_Brokerage_USD"] = df["Brokerage_USD"] + df["Client_Commission_USD"]
 
-# Minimum markup points needed to break-even (Brokerage >= 0)
-# Brokerage = PV_USD_perLot*points*lots - LP - IB
-# => points >= (LP + IB) / (PV_USD_perLot*lots)
+# Loss flags
+df["Broker_Negative"] = df["Brokerage_USD"] < 0
+df["Net_Broker_Negative"] = df["Net_Brokerage_USD"] < 0
+
+# Minimum markup points needed to break-even (OLD)
 den = (df["PointValue_USD_perLot"].replace(0, pd.NA) * float(lots))
 df["Min_Markup_Points_Breakeven"] = ((df["LP_Commission_USD"] + df["IB_Commission_USD"]) / den).fillna(0.0)
-
-# Suggested markup points = max(current markup_points, min_breakeven_points)
 df["Suggested_Markup_Points"] = df["Min_Markup_Points_Breakeven"].apply(lambda x: max(float(markup_points), float(x)))
 
-# If you applied Suggested_Markup_Points, what would brokerage be?
 df["Brokerage_USD_If_Suggested"] = (
     df["PointValue_USD_perLot"] * df["Suggested_Markup_Points"] * float(lots)
     - df["LP_Commission_USD"]
     - df["IB_Commission_USD"]
 )
-
 df["Still_Negative_After_Suggested"] = df["Brokerage_USD_If_Suggested"] < 0
+
+# ✅ NEW: Minimum markup points needed to break-even (NET, considering client commission)
+# Net_Brokerage = PV*points*lots - LP - IB + ClientCommission
+# => points >= (LP + IB - ClientCommission) / (PV*lots)
+num_net = (df["LP_Commission_USD"] + df["IB_Commission_USD"] - df["Client_Commission_USD"])
+df["Min_Markup_Points_Breakeven_Net"] = (num_net / den).fillna(0.0)
+df["Min_Markup_Points_Breakeven_Net"] = df["Min_Markup_Points_Breakeven_Net"].clip(lower=0.0)
+
+df["Suggested_Markup_Points_Net"] = df["Min_Markup_Points_Breakeven_Net"].apply(
+    lambda x: max(float(markup_points), float(x))
+)
+
+df["Net_Brokerage_USD_If_Suggested"] = (
+    df["PointValue_USD_perLot"] * df["Suggested_Markup_Points_Net"] * float(lots)
+    - df["LP_Commission_USD"]
+    - df["IB_Commission_USD"]
+    + df["Client_Commission_USD"]
+)
+df["Still_Negative_After_Suggested_Net"] = df["Net_Brokerage_USD_If_Suggested"] < 0
 
 # ============================================================
 # REPORT
@@ -225,11 +315,22 @@ report_cols = [
     "Markup_USD",
     "LP_Commission_USD",
     "IB_Commission_USD",
-    "Brokerage_USD",
-    "Suggested_Markup_Points",
-    "Broker_Negative",
-]
 
+    # ✅ NEW
+    "Client_Comm_perLot_USD",
+    "Client_Commission_USD",
+
+    # Existing + new net view
+    "Brokerage_USD",
+    "Net_Brokerage_USD",
+
+    # Suggested points (old + net)
+    "Suggested_Markup_Points",
+    "Suggested_Markup_Points_Net",
+
+    "Broker_Negative",
+    "Net_Broker_Negative",
+]
 
 report = df[report_cols].copy()
 
