@@ -333,7 +333,6 @@ report_cols = [
     "Net_Brokerage_USD",
     "Suggested_Markup_Points",
     "Suggested_Markup_Points_Net",
-    "Broker_Negative",
     "Net_Broker_Negative",
 ]
 
