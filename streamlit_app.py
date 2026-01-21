@@ -330,7 +330,6 @@ report_cols = [
 
     "LP_Commission_USD",
     "IB_Commission_USD",
-    "Brokerage_USD",
     "Net_Brokerage_USD",
     "Suggested_Markup_Points",
     "Suggested_Markup_Points_Net",
