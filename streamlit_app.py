@@ -23,6 +23,10 @@ def fx_to_usd() -> dict:
     Returns mapping: 1 CCY = X USD
     Tries a couple of public FX APIs. If unavailable, uses a small fallback.
     NOTE: These are spot FX rates for currency conversion (not broker rates).
+
+    ✅ FIX APPLIED:
+    - Added a sanity check for USDJPY to avoid wrong feeds like 15.x (which cause 0.063)
+    - If invalid, tries next API; otherwise fallback uses JPY=0.0063
     """
     urls = [
         "https://open.er-api.com/v6/latest/USD",
@@ -41,6 +45,14 @@ def fx_to_usd() -> dict:
             if not rates:
                 continue
 
+            # ✅ Sanity check: USD->JPY should be realistic (roughly 50..300)
+            try:
+                jpy_per_usd = float(rates.get("JPY")) if rates.get("JPY") is not None else None
+                if jpy_per_usd is not None and (jpy_per_usd < 50 or jpy_per_usd > 300):
+                    continue  # bad feed, try next url
+            except Exception:
+                pass
+
             out = {}
             for k, v in rates.items():
                 try:
@@ -57,7 +69,7 @@ def fx_to_usd() -> dict:
             continue
 
     st.warning("FX API unavailable. Using fallback FX rates (please verify).")
-    return {"USD": 1.0, "EUR": 1.08, "GBP": 1.26, "JPY": 0.0068, "AUD": 0.66, "CAD": 0.74, "CHF": 1.11}
+    return {"USD": 1.0, "EUR": 1.08, "GBP": 1.26, "JPY": 0.0063, "AUD": 0.66, "CAD": 0.74, "CHF": 1.11}
 
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
