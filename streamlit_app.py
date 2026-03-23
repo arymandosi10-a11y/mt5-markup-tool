@@ -22,11 +22,6 @@ def fx_to_usd() -> dict:
     """
     Returns mapping: 1 CCY = X USD
     Tries a couple of public FX APIs. If unavailable, uses a small fallback.
-    NOTE: These are spot FX rates for currency conversion (not broker rates).
-
-    ✅ FIX APPLIED:
-    - Added a sanity check for USDJPY to avoid wrong feeds like 15.x (which cause 0.063)
-    - If invalid, tries next API; otherwise fallback uses JPY=0.0063
     """
     urls = [
         "https://open.er-api.com/v6/latest/USD",
@@ -38,18 +33,14 @@ def fx_to_usd() -> dict:
             r.raise_for_status()
             data = r.json()
 
-            # API variations:
-            # - open.er-api: conversion_rates
-            # - exchangerate.host: rates
             rates = data.get("rates") or data.get("conversion_rates")  # 1 USD = X CCY
             if not rates:
                 continue
 
-            # ✅ Sanity check: USD->JPY should be realistic (roughly 50..300)
             try:
                 jpy_per_usd = float(rates.get("JPY")) if rates.get("JPY") is not None else None
                 if jpy_per_usd is not None and (jpy_per_usd < 50 or jpy_per_usd > 300):
-                    continue  # bad feed, try next url
+                    continue
             except Exception:
                 pass
 
@@ -69,7 +60,15 @@ def fx_to_usd() -> dict:
             continue
 
     st.warning("FX API unavailable. Using fallback FX rates (please verify).")
-    return {"USD": 1.0, "EUR": 1.08, "GBP": 1.26, "JPY": 0.0063, "AUD": 0.66, "CAD": 0.74, "CHF": 1.11}
+    return {
+        "USD": 1.0,
+        "EUR": 1.08,
+        "GBP": 1.26,
+        "JPY": 0.0063,
+        "AUD": 0.66,
+        "CAD": 0.74,
+        "CHF": 1.11
+    }
 
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
@@ -80,7 +79,7 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 
 # ============================================================
-# CLIENT COMMISSION PARSER (SYMBOL-WISE)
+# HELPERS
 # ============================================================
 def parse_commission_overrides(text: str) -> dict:
     """
@@ -114,6 +113,42 @@ def parse_commission_overrides(text: str) -> dict:
     return out
 
 
+def normalize_symbol_col(df_in: pd.DataFrame, possible_cols: list):
+    for c in possible_cols:
+        if c in df_in.columns:
+            return c
+    return None
+
+
+def load_markup_sheet(markup_file) -> pd.DataFrame:
+    """
+    Expected markup sheet columns:
+    - Symbol / Symbol Name
+    - Markup / Markup Points / Markup (points)
+
+    Returns:
+      Symbol | Existing_Markup_Points
+    """
+    mdf = pd.read_excel(markup_file)
+    mdf.columns = [str(c).strip() for c in mdf.columns]
+
+    sym_col = normalize_symbol_col(mdf, ["Symbol", "Symbol Name"])
+    mkp_col = normalize_symbol_col(mdf, ["Markup", "Markup Points", "Markup (points)"])
+
+    if sym_col is None or mkp_col is None:
+        raise ValueError(
+            "Markup sheet must contain columns like: Symbol (or Symbol Name) and Markup (or Markup Points / Markup (points))"
+        )
+
+    out = mdf[[sym_col, mkp_col]].copy()
+    out.columns = ["Symbol", "Existing_Markup_Points"]
+    out["Symbol"] = out["Symbol"].astype(str).str.upper().str.strip()
+    out["Existing_Markup_Points"] = pd.to_numeric(out["Existing_Markup_Points"], errors="coerce").fillna(0.0)
+
+    out = out.drop_duplicates(subset=["Symbol"], keep="last")
+    return out
+
+
 # ============================================================
 # SIDEBAR
 # ============================================================
@@ -123,7 +158,20 @@ with st.sidebar:
     lots = st.number_input("Lots", min_value=0.01, value=1.00, step=0.01)
     markup_points = st.number_input("Markup (points)", min_value=0.0, value=20.0, step=1.0)
 
-    # ✅ Client commission (charged to client) - below markup
+    # ✅ NEW: Markup sheet option
+    st.subheader("Markup Sheet")
+    use_markup_sheet = st.checkbox("Use symbol-wise markup sheet", value=False)
+
+    st.caption("Optional: upload symbol-wise existing markup points")
+    markup_sheet_file = st.file_uploader(
+        "Upload Markup Sheet",
+        type=["xlsx"],
+        key="markup_sheet_file"
+    ) if use_markup_sheet else None
+
+    st.divider()
+
+    # ✅ Client commission (charged to client)
     st.subheader("Client Commission (USD)")
     commission_mode = st.selectbox(
         "Commission mode",
@@ -158,11 +206,29 @@ with st.sidebar:
         client_comm_overrides = parse_commission_overrides(client_comm_overrides_text)
 
     st.divider()
+
     st.subheader("LP Commission")
     lp_rate = st.number_input("LP rate ($ per 1M per side)", min_value=0.0, value=7.0, step=0.5)
     sides = st.selectbox("Sides (LP only)", [1, 2], index=1)
 
+    # ✅ NEW: Bridge costing
+    st.subheader("Bridge Costing")
+    bridge_mode = st.selectbox(
+        "Bridge cost mode",
+        ["None", "$ per 1M volume"],
+        index=0
+    )
+    bridge_rate = 0.0
+    if bridge_mode == "$ per 1M volume":
+        bridge_rate = st.number_input(
+            "Bridge rate ($ per 1M)",
+            min_value=0.0,
+            value=0.0,
+            step=0.5
+        )
+
     st.divider()
+
     st.subheader("IB Commission (NO SIDES used)")
     ib_mode = st.selectbox("Type", ["None", "Fixed ($ per lot)", "Point-wise (points)"], index=0)
 
@@ -181,7 +247,7 @@ with st.sidebar:
 
 
 # ============================================================
-# FILE UPLOAD
+# MAIN FILE UPLOAD
 # ============================================================
 file = st.file_uploader("Upload Symbol Excel (Book2.xlsx)", type=["xlsx"])
 if not file:
@@ -215,14 +281,36 @@ if missing:
 # ============================================================
 df["Symbol Name"] = df["Symbol Name"].astype(str).str.strip()
 df["Symbol"] = df["Symbol Name"].astype(str).str.upper().str.strip()
-
 df["Profit Currency"] = df["Profit Currency"].astype(str).str.upper().str.strip()
 df["Digits"] = pd.to_numeric(df["Digits"], errors="coerce")
 df["Contract Size"] = pd.to_numeric(df["Contract Size"], errors="coerce")
 df["Price"] = pd.to_numeric(df[price_col], errors="coerce")
-
-# For transparency
 df["Price_Source"] = "file"
+
+# ============================================================
+# OPTIONAL MARKUP SHEET MERGE
+# ============================================================
+df["Existing_Markup_Points"] = pd.NA
+df["Applied_Markup_Points"] = float(markup_points)
+df["Markup_Source"] = "Default Sidebar"
+
+if use_markup_sheet and markup_sheet_file is not None:
+    try:
+        markup_df = load_markup_sheet(markup_sheet_file)
+        df = df.merge(markup_df, on="Symbol", how="left", suffixes=("", "_ms"))
+
+        # if merge created duplicate due to existing placeholder column
+        if "Existing_Markup_Points_ms" in df.columns:
+            df["Existing_Markup_Points"] = df["Existing_Markup_Points_ms"]
+            df.drop(columns=["Existing_Markup_Points_ms"], inplace=True)
+
+        df["Applied_Markup_Points"] = df["Existing_Markup_Points"].fillna(float(markup_points))
+        df["Markup_Source"] = df["Existing_Markup_Points"].notna().map(
+            lambda x: "Markup Sheet" if x else "Default Sidebar"
+        )
+    except Exception as e:
+        st.error(f"Markup sheet error: {e}")
+        st.stop()
 
 # ============================================================
 # FX (Profit currency only)
@@ -230,7 +318,6 @@ df["Price_Source"] = "file"
 fx = fx_to_usd()
 df["Profit_to_USD"] = df["Profit Currency"].map(fx)
 
-# If a profit currency is missing from FX feed, keep 1.0 but flag it
 df["FX_Missing"] = df["Profit_to_USD"].isna()
 df["Profit_to_USD"] = df["Profit_to_USD"].fillna(1.0)
 
@@ -246,18 +333,24 @@ df["PointValue_Profit_perLot"] = df["Contract Size"].fillna(0.0) * df["PointSize
 # Point value per lot in USD
 df["PointValue_USD_perLot"] = df["PointValue_Profit_perLot"] * df["Profit_to_USD"]
 
-# Markup
-df["Markup_Profit"] = df["PointValue_Profit_perLot"] * float(markup_points) * float(lots)
+# ✅ Markup using applied markup points (sheet or default)
+df["Markup_Profit"] = df["PointValue_Profit_perLot"] * df["Applied_Markup_Points"] * float(lots)
 df["Markup_USD"] = df["Markup_Profit"] * df["Profit_to_USD"]
 
-# Notional (in profit currency using file price)
+# Notional
 df["Notional_Profit"] = df["Price"].fillna(0.0) * df["Contract Size"].fillna(0.0) * float(lots)
 df["Notional_USD"] = df["Notional_Profit"] * df["Profit_to_USD"]
 
-# LP Commission ($ per 1M per side) - uses sides
+# LP Commission ($ per 1M per side)
 df["LP_Commission_USD"] = (df["Notional_USD"] / 1_000_000.0) * float(lp_rate) * float(sides)
 
-# IB Commission (NO SIDES for any type)
+# ✅ Bridge Costing ($ per 1M volume)
+if bridge_mode == "$ per 1M volume":
+    df["Bridge_Cost_USD"] = (df["Notional_USD"] / 1_000_000.0) * float(bridge_rate)
+else:
+    df["Bridge_Cost_USD"] = 0.0
+
+# IB Commission
 if ib_mode == "Fixed ($ per lot)":
     df["IB_Commission_USD"] = float(ib_fixed_per_lot) * float(lots)
 elif ib_mode == "Point-wise (points)":
@@ -265,7 +358,7 @@ elif ib_mode == "Point-wise (points)":
 else:
     df["IB_Commission_USD"] = 0.0
 
-# ✅ Client Commission (charged to client): fixed USD per lot, optional symbol-wise
+# Client Commission
 if commission_mode == "None":
     df["Client_Comm_perLot_USD"] = 0.0
 elif commission_mode == "Fixed ($ per lot)":
@@ -277,34 +370,58 @@ else:
 
 df["Client_Commission_USD"] = df["Client_Comm_perLot_USD"] * float(lots)
 
-# Brokerage = Markup - LP - IB   (kept as-is)
-df["Brokerage_USD"] = df["Markup_USD"] - df["LP_Commission_USD"] - df["IB_Commission_USD"]
+# ============================================================
+# FINAL BROKERAGE FORMULAS
+# ============================================================
+# Gross brokerage = Markup - LP - Bridge - IB
+df["Brokerage_USD"] = (
+    df["Markup_USD"]
+    - df["LP_Commission_USD"]
+    - df["Bridge_Cost_USD"]
+    - df["IB_Commission_USD"]
+)
 
-# ✅ UPDATED: Net brokerage formula you asked:
-# (Markup_USD + Client_Commission_USD) - (LP_Commission_USD + IB_Commission_USD)
+# Net brokerage = (Markup + Client Commission) - (LP + Bridge + IB)
 df["Net_Brokerage_USD"] = (
     (df["Markup_USD"] + df["Client_Commission_USD"])
-    - (df["LP_Commission_USD"] + df["IB_Commission_USD"])
+    - (df["LP_Commission_USD"] + df["Bridge_Cost_USD"] + df["IB_Commission_USD"])
 )
 
 # Loss flags
 df["Broker_Negative"] = df["Brokerage_USD"] < 0
 df["Net_Broker_Negative"] = df["Net_Brokerage_USD"] < 0
 
-# Minimum markup points needed to break-even (OLD brokerage only)
+# ============================================================
+# BREAKEVEN / SUGGESTED MARKUP
+# ============================================================
 den = (df["PointValue_USD_perLot"].replace(0, pd.NA) * float(lots))
-df["Min_Markup_Points_Breakeven"] = ((df["LP_Commission_USD"] + df["IB_Commission_USD"]) / den).fillna(0.0)
-df["Suggested_Markup_Points"] = df["Min_Markup_Points_Breakeven"].apply(lambda x: max(float(markup_points), float(x)))
+
+# Gross breakeven markup points
+df["Min_Markup_Points_Breakeven"] = (
+    (df["LP_Commission_USD"] + df["Bridge_Cost_USD"] + df["IB_Commission_USD"]) / den
+).fillna(0.0)
+
+df["Suggested_Markup_Points"] = df["Min_Markup_Points_Breakeven"].apply(
+    lambda x: max(float(markup_points), float(x))
+)
 
 df["Brokerage_USD_If_Suggested"] = (
     df["PointValue_USD_perLot"] * df["Suggested_Markup_Points"] * float(lots)
     - df["LP_Commission_USD"]
+    - df["Bridge_Cost_USD"]
     - df["IB_Commission_USD"]
 )
+
 df["Still_Negative_After_Suggested"] = df["Brokerage_USD_If_Suggested"] < 0
 
-# ✅ Minimum markup points needed to break-even (NET, considering client commission)
-num_net = (df["LP_Commission_USD"] + df["IB_Commission_USD"] - df["Client_Commission_USD"])
+# Net breakeven markup points
+num_net = (
+    df["LP_Commission_USD"]
+    + df["Bridge_Cost_USD"]
+    + df["IB_Commission_USD"]
+    - df["Client_Commission_USD"]
+)
+
 df["Min_Markup_Points_Breakeven_Net"] = (num_net / den).fillna(0.0)
 df["Min_Markup_Points_Breakeven_Net"] = df["Min_Markup_Points_Breakeven_Net"].clip(lower=0.0)
 
@@ -315,15 +432,15 @@ df["Suggested_Markup_Points_Net"] = df["Min_Markup_Points_Breakeven_Net"].apply(
 df["Net_Brokerage_USD_If_Suggested"] = (
     df["PointValue_USD_perLot"] * df["Suggested_Markup_Points_Net"] * float(lots)
     - df["LP_Commission_USD"]
+    - df["Bridge_Cost_USD"]
     - df["IB_Commission_USD"]
     + df["Client_Commission_USD"]
 )
+
 df["Still_Negative_After_Suggested_Net"] = df["Net_Brokerage_USD_If_Suggested"] < 0
 
 # ============================================================
 # REPORT
-# - ✅ Client_Commission_USD immediately AFTER Markup_USD
-# - ❌ Remove Column M from your screenshot (Client_Comm_perLot_USD) by NOT including it
 # ============================================================
 report_cols = [
     "Symbol Name",
@@ -334,14 +451,16 @@ report_cols = [
     "PointSize",
     "PointValue_Profit_perLot",
     "PointValue_USD_perLot",
+    "Existing_Markup_Points",
+    "Applied_Markup_Points",
+    "Markup_Source",
     "Markup_Profit",
     "Markup_USD",
-
-    # ✅ only this, right after Markup_USD
     "Client_Commission_USD",
-
     "LP_Commission_USD",
+    "Bridge_Cost_USD",
     "IB_Commission_USD",
+    "Brokerage_USD",
     "Net_Brokerage_USD",
     "Suggested_Markup_Points",
     "Suggested_Markup_Points_Net",
